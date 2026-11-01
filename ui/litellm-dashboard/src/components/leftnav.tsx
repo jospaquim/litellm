@@ -38,6 +38,7 @@ import {
   ExternalLink,
   FileText,
   FlaskConical,
+  Gauge,
   Folder,
   HeartPulse,
   House,
@@ -210,6 +211,7 @@ const menuGroups: MenuGroup[] = [
     items: [
       { key: "home", page: "home", label: "Home", icon: <House {...ICON} /> },
       { key: "api-keys", page: "api-keys", label: "Virtual Keys", icon: <KeyRound {...ICON} /> },
+      { key: "my-usage", page: "my-usage", label: "Mi consumo", icon: <Gauge {...ICON} /> },
       {
         key: "llm-playground",
         page: "llm-playground",

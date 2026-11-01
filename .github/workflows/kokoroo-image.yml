@@ -1,0 +1,114 @@
+# Workflow para un fork de BerriAI/litellm.
+# Construye la UI con el parche "Mi consumo" y publica una imagen que es la oficial + la UI propia:
+# el backend queda idéntico al de ghcr.io/berriai/litellm@<digest>. Ver README.md de esta carpeta.
+#
+# Seguridad:
+# - Dos jobs: "build" ejecuta npm (scripts de terceros) SIN permisos de escritura ni credenciales;
+#   "publish" tiene packages:write pero no ejecuta npm ni código del repo, solo recibe el artefacto.
+# - Acciones fijadas por SHA de commit; imagen base fijada por digest y verificada contra el tag.
+# - Sin docker/setup-buildx-action: se usa el docker del runner (Buildx/BuildKit no quedan como dependencia mutable).
+# - Entradas validadas con regex antes de usarse.
+name: kokoroo-litellm-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Tag de LiteLLM, p. ej. v1.106.6. La rama del fork debe salir de este mismo tag."
+        required: true
+      base_digest:
+        description: "Digest de ghcr.io/berriai/litellm:<base_tag>, p. ej. sha256:37e2..."
+        required: true
+
+permissions: {}
+
+env:
+  UI_DIR: ui/litellm-dashboard
+  UI_OUT_IN_IMAGE: /app/.venv/lib/python3.13/site-packages/litellm/proxy/_experimental/out
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Validar entradas
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          BASE_DIGEST: ${{ inputs.base_digest }}
+        run: |
+          [[ "$BASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || { echo "base_tag inválido"; exit 1; }
+          [[ "$BASE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "base_digest inválido"; exit 1; }
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: ${{ env.UI_DIR }}/.nvmrc
+          cache: npm
+          cache-dependency-path: ${{ env.UI_DIR }}/package-lock.json
+
+      - name: Compilar la UI (lint de la página + typecheck + build)
+        working-directory: ${{ env.UI_DIR }}
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm ci --no-audit --no-fund
+          npx eslint "src/app/(dashboard)/my-usage" "src/app/(dashboard)/hooks/myUsage" src/components/leftnav.tsx
+          npx vitest run --project component "src/app/(dashboard)/my-usage"
+          npx tsc --project tsconfig.production.json --noEmit
+          npm run build
+          test -f out/index.html
+          test -e out/my-usage/index.html || test -e out/my-usage.html
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui-out
+          path: ${{ env.UI_DIR }}/out
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ui-out
+          path: ui-out
+
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verificar que el digest corresponde al tag
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          BASE_DIGEST: ${{ inputs.base_digest }}
+        run: |
+          docker pull "ghcr.io/berriai/litellm:${BASE_TAG}" >/dev/null
+          actual="$(docker image inspect "ghcr.io/berriai/litellm:${BASE_TAG}" --format '{{index .RepoDigests 0}}')"
+          [ "$actual" = "ghcr.io/berriai/litellm@${BASE_DIGEST}" ] || { echo "El tag ${BASE_TAG} apunta a ${actual}, no a ${BASE_DIGEST}"; exit 1; }
+
+      - name: Imagen = oficial (por digest) + UI propia
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          BASE_DIGEST: ${{ inputs.base_digest }}
+        run: |
+          {
+            echo "FROM ghcr.io/berriai/litellm@${BASE_DIGEST}"
+            echo "RUN rm -rf ${UI_OUT_IN_IMAGE}/*"
+            echo "COPY ui-out/ ${UI_OUT_IN_IMAGE}/"
+          } > Dockerfile.kokoroo
+          repo="ghcr.io/$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')/litellm-kokoroo"
+          docker build -f Dockerfile.kokoroo -t "$repo:$BASE_TAG" .
+          docker push "$repo:$BASE_TAG"
